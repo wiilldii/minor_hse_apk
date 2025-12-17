@@ -1,0 +1,225 @@
+install_if_missing <- function(pkgs) {
+  to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+}
+
+pkgs <- c(
+  "tidyverse", "ggrepel", "patchwork",
+  "DiagrammeR", "igraph", "ggraph"
+)
+install_if_missing(pkgs)
+
+opt_pkgs <- c("DiagrammeRsvg", "rsvg")
+install_if_missing(opt_pkgs)
+
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+library(DiagrammeR)
+library(igraph)
+library(ggraph)
+
+out_dir <- "figs"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+set.seed(1)
+
+df <- tibble(
+  clone = paste0("C", sprintf("%02d", 1:30)),
+  growth_g_m2_day    = rnorm(30, mean = 18, sd = 4),
+  n_removal_mgL_day  = rnorm(30, mean = 12, sd = 3),
+  p_removal_mgL_day  = rnorm(30, mean = 2.5, sd = 0.7),
+  stability          = runif(30, 0.60, 0.95)
+) %>%
+  mutate(np_removal_mgL_day = n_removal_mgL_day + p_removal_mgL_day)
+
+thr_growth <- 18
+thr_nprem  <- 14.0
+
+df_steps <- expand_grid(
+  condition = factor(paste0("Ступень ", 1:4), levels = paste0("Ступень ", 1:4)),
+  clone = paste0("C", sprintf("%02d", 1:10))
+) %>%
+  mutate(
+    growth = rnorm(n(), 18, 4) - (as.integer(condition) - 1) * 1.5,
+    n_rem  = rnorm(n(), 12, 3) - (as.integer(condition) - 1) * 0.8,
+    p_rem  = rnorm(n(), 2.5, 0.6) - (as.integer(condition) - 1) * 0.2
+  )
+
+flow_dot <- "
+digraph flow {
+  graph [layout = dot, rankdir = LR]
+  node  [shape = box, style = filled, fontname = Helvetica]
+
+  inflow  [label = 'СТОЧНАЯ ВОДА\\nTN, TP, NH4+, PO4\\npH, T°, мутность\\nрасход Q (л/ч)', fillcolor = 'lightgray']
+  module  [label = 'МОДУЛЬ С РЯСКОЙ\\nплощадь A (м²)\\nсвет, t удержания', fillcolor = 'palegreen']
+  outflow [label = 'ОЧИЩЕННАЯ ВОДА\\nTN↓ TP↓\\nC_out', fillcolor = 'lightblue']
+  biomass [label = 'БИОМАССА\\nг/м²/сут\\nприменение: биогаз/удобрение', fillcolor = 'khaki']
+
+  inflow -> module [label='C_in']
+  module -> outflow [label='C_out']
+  module -> biomass [label='ΔB']
+}
+"
+
+flow_viz <- grViz(flow_dot)
+flow_viz
+
+can_export <- requireNamespace("DiagrammeRsvg", quietly = TRUE) &&
+              requireNamespace("rsvg", quietly = TRUE)
+
+if (can_export) {
+  svg_txt <- DiagrammeRsvg::export_svg(flow_viz)
+  svg_path <- file.path(out_dir, "01_flow_diagram.svg")
+  writeLines(svg_txt, svg_path)
+
+  png_path <- file.path(out_dir, "01_flow_diagram.png")
+  rsvg::rsvg_png(charToRaw(svg_txt), file = png_path, width = 1600)
+}
+
+p_quadrant <- ggplot(df, aes(x = np_removal_mgL_day, y = growth_g_m2_day)) +
+  geom_point(aes(size = stability), alpha = 0.85) +
+  geom_vline(xintercept = thr_nprem, linetype = 2) +
+  geom_hline(yintercept = thr_growth, linetype = 2) +
+  annotate(
+    "rect",
+    xmin = thr_nprem, xmax = Inf,
+    ymin = thr_growth, ymax = Inf,
+    alpha = 0.08
+  ) +
+  ggrepel::geom_text_repel(
+    data = df %>% filter(
+      np_removal_mgL_day >= thr_nprem,
+      growth_g_m2_day >= thr_growth
+    ),
+    aes(label = clone),
+    size = 3,
+    max.overlaps = 10
+  ) +
+  scale_size_continuous(range = c(2, 7)) +
+  labs(
+    title = "Матрица 2×2: рост × удаление N+P",
+    x = "Суммарная скорость удаления N+P, мг/л/сут",
+    y = "Продуктивность биомассы, г/м²/сут",
+    size = "Стабильность"
+  ) +
+  theme_minimal()
+
+ggsave(
+  file.path(out_dir, "02_quadrant_growth_vs_NP.png"),
+  p_quadrant,
+  width = 9,
+  height = 6,
+  dpi = 200
+)
+p_quadrant
+
+nodes <- tibble(
+  name = c(
+    "KPI: Рост", "KPI: Удаление N/P", "KPI: Стабильность",
+    "NH4+/NH3", "Мутность/свет", "pH", "Температура"
+  ),
+  type = c("KPI","KPI","KPI","Stress","Stress","Stress","Stress")
+)
+
+edges <- tribble(
+  ~from,           ~to,                 ~weight,
+  "NH4+/NH3",      "KPI: Рост",          3,
+  "NH4+/NH3",      "KPI: Удаление N/P",  2,
+  "Мутность/свет", "KPI: Рост",          3,
+  "Мутность/свет", "KPI: Стабильность",  2,
+  "pH",            "KPI: Рост",          2,
+  "pH",            "KPI: Удаление N/P",  2,
+  "Температура",   "KPI: Рост",          2,
+  "Температура",   "KPI: Стабильность",  3
+)
+
+g <- graph_from_data_frame(edges, vertices = nodes, directed = TRUE)
+
+p_network <- ggraph(g, layout = "stress") +
+  geom_edge_link(
+    aes(width = weight),
+    alpha = 0.75,
+    arrow = arrow(length = unit(3, "mm"))
+  ) +
+  geom_node_point(size = 6) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 4) +
+  scale_edge_width(range = c(0.4, 1.5)) +
+  labs(title = "Факторы стресса → влияние на KPI") +
+  theme_void()
+
+ggsave(
+  file.path(out_dir, "03_stress_to_KPI_network.png"),
+  p_network,
+  width = 9,
+  height = 6,
+  dpi = 200
+)
+p_network
+
+top_growth <- df_steps %>%
+  group_by(clone) %>%
+  summarise(growth_mean = mean(growth), .groups = "drop") %>%
+  slice_max(growth_mean, n = 5)
+
+p_bar_growth <- ggplot(
+  top_growth,
+  aes(x = reorder(clone, growth_mean), y = growth_mean)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "ТОП-5 по росту",
+    x = NULL,
+    y = "г/м²/сут (среднее)"
+  ) +
+  theme_minimal()
+
+top_np <- df_steps %>%
+  filter(clone %in% top_growth$clone) %>%
+  summarise(
+    N = mean(n_rem),
+    P = mean(p_rem)
+  ) %>%
+  pivot_longer(everything(), names_to = "nutrient", values_to = "rate")
+
+p_bar_np <- ggplot(top_np, aes(x = nutrient, y = rate)) +
+  geom_col() +
+  labs(
+    title = "Средняя скорость извлечения",
+    x = NULL,
+    y = "мг/л/сут"
+  ) +
+  theme_minimal()
+
+stab <- df_steps %>%
+  group_by(condition) %>%
+  summarise(
+    growth_mean = mean(growth),
+    n_mean = mean(n_rem),
+    p_mean = mean(p_rem),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-condition, names_to = "metric", values_to = "value")
+
+p_heat <- ggplot(stab, aes(x = metric, y = condition, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 1)), size = 4) +
+  labs(
+    title = "Стабильность по ступеням",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal()
+
+p_dashboard <- (p_bar_growth | p_bar_np | p_heat) +
+  plot_annotation(title = "KPI-дашборд (пример)")
+
+ggsave(
+  file.path(out_dir, "04_KPI_dashboard.png"),
+  p_dashboard,
+  width = 13,
+  height = 5,
+  dpi = 200
+)
+p_dashboard
