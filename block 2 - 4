@@ -1,0 +1,121 @@
+install_if_missing <- function(pkgs) {
+  to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+}
+
+pkgs <- c("tidyverse", "ggrepel", "patchwork")
+install_if_missing(pkgs)
+
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+
+out_dir <- "figs"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+theme_helv <- function() {
+  theme_minimal(base_family = "Helvetica") +
+    theme(
+      plot.title    = element_text(face = "bold", size = 18),
+      plot.subtitle = element_text(size = 12),
+      axis.title    = element_text(size = 12),
+      axis.text     = element_text(size = 11),
+      legend.title  = element_text(size = 11),
+      legend.text   = element_text(size = 10),
+      panel.grid.minor = element_blank()
+    )
+}
+
+set.seed(42)
+
+days <- 0:10
+df_water <- expand_grid(
+  day = days,
+  nutrient = c("N", "P"),
+  stream = c("Cin", "Cout"),
+  group = c("Control", "Elite")
+) %>%
+  mutate(
+    Cin_base = if_else(nutrient == "N", 30, 5),
+    Cout_start = if_else(nutrient == "N", 26, 4.5),
+    Cout_end_control = if_else(nutrient == "N", 18, 3.5),
+    Cout_end_elite   = if_else(nutrient == "N", 10, 2.0),
+    conc_mgL = case_when(
+      stream == "Cin" ~ Cin_base + rnorm(n(), 0, if_else(nutrient=="N", 0.6, 0.15)),
+      stream == "Cout" & group == "Control" ~
+        (Cout_start + (Cout_end_control - Cout_start) * (day / max(days))) +
+        rnorm(n(), 0, if_else(nutrient=="N", 0.5, 0.12)),
+      stream == "Cout" & group == "Elite" ~
+        (Cout_start + (Cout_end_elite - Cout_start) * (day / max(days))) +
+        rnorm(n(), 0, if_else(nutrient=="N", 0.4, 0.10)),
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(day, nutrient, stream, group, conc_mgL)
+
+df_growth <- tibble(
+  day = rep(days, 2),
+  group = rep(c("Control", "Elite"), each = length(days))
+) %>%
+  mutate(
+    biomass_g_m2 = case_when(
+      group == "Control" ~ 60 * exp(0.12 * day) + rnorm(n(), 0, 8),
+      group == "Elite"   ~ 60 * exp(0.18 * day) + rnorm(n(), 0, 10)
+    )
+  )
+
+df_steps <- expand_grid(
+  step = factor(paste0("Ступень ", 1:4), levels = paste0("Ступень ", 1:4)),
+  group = c("Control", "Elite")
+) %>%
+  mutate(
+    growth = if_else(group=="Elite", 20, 17) - (as.integer(step) - 1) * if_else(group=="Elite", 2.0, 2.7) + rnorm(n(), 0, 0.6),
+    n_rem  = if_else(group=="Elite", 12, 10.5) - (as.integer(step) - 1) * if_else(group=="Elite", 0.4, 0.7) + rnorm(n(), 0, 0.3),
+    p_rem  = if_else(group=="Elite", 2.7, 2.3) - (as.integer(step) - 1) * if_else(group=="Elite", 0.15, 0.25) + rnorm(n(), 0, 0.08)
+  )
+
+df_clones <- tibble(
+  clone = paste0("C", sprintf("%02d", 1:30)),
+  growth_g_m2_day    = rnorm(30, mean = 18, sd = 4),
+  n_removal_mgL_day  = rnorm(30, mean = 12, sd = 3),
+  p_removal_mgL_day  = rnorm(30, mean = 2.5, sd = 0.7),
+  stability          = runif(30, 0.60, 0.95)
+) %>%
+  mutate(
+    np_removal_mgL_day = n_removal_mgL_day + p_removal_mgL_day
+  )
+
+thr_growth <- 18
+thr_nprem  <- 14
+df_clones <- df_clones %>%
+  mutate(is_elite = (growth_g_m2_day >= thr_growth & np_removal_mgL_day >= thr_nprem & stability >= 0.80))
+
+kpi_raw <- tibble(
+  group = c("Control", "Elite"),
+  Growth = c(mean(df_steps$growth[df_steps$group=="Control"]),
+             mean(df_steps$growth[df_steps$group=="Elite"])),
+  NP_Removal = c(mean(df_steps$n_rem[df_steps$group=="Control"]) + mean(df_steps$p_rem[df_steps$group=="Control"]),
+                 mean(df_steps$n_rem[df_steps$group=="Elite"]) + mean(df_steps$p_rem[df_steps$group=="Elite"])),
+  Tolerance = c(0.65, 0.85),
+  Stability = c(0.70, 0.88)
+)
+
+norm01 <- function(x) (x - min(x)) / (max(x) - min(x) + 1e-9)
+
+kpi_norm <- kpi_raw %>%
+  mutate(
+    Growth = norm01(Growth),
+    NP_Removal = norm01(NP_Removal)
+  )
+
+df_risk <- tribble(
+  ~risk, ~prob, ~impact, ~mitigation,
+  "Загрязнители/патогены → ограничение применения биомассы", "High", "High", "Разделение стоков; анализ; биомасса → биогаз/удобрение",
+  "Контаминация водорослями/другими видами", "Med", "High", "Закрытые модули; санитарный режим; плотность ковра",
+  "Нестабильность состава стока", "High", "Med", "Буферизация/разбавление; цифровой двойник режимов",
+  "Trade-off: рост vs очистка", "Med", "Med", "Селекционный индекс; отбор по верхнему правому квадранту",
+  "Сезонность (свет/температура)", "High", "Med", "Сценарии лето/зима; режимы/подсветка при необходимости",
+  "Операционные (гидравлика/вынос биомассы)", "Med", "Low", "Сетки/барьеры; регламент съёма; контроль потока"
+)
+
+message("Готово! Файлы сохранены в папке ./figs.")
